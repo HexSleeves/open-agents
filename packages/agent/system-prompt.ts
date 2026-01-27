@@ -1,3 +1,5 @@
+import type { SkillMetadata } from "./skills/types";
+
 export const DEEP_AGENT_SYSTEM_PROMPT = `You are a deep agent - an AI coding assistant capable of handling complex, multi-step tasks through planning, context management, and delegation.
 
 # Role & Agency
@@ -192,6 +194,43 @@ export interface BuildSystemPromptOptions {
   currentBranch?: string;
   customInstructions?: string;
   environmentDetails?: string;
+  skills?: SkillMetadata[];
+}
+
+/**
+ * Build the skills section for the system prompt.
+ * Lists available skills that the agent can invoke.
+ */
+function buildSkillsPrompt(skills: SkillMetadata[]): string {
+  if (skills.length === 0) return "";
+
+  // Filter to skills the model can actually invoke:
+  // - Must NOT have model invocation disabled
+  const invocableSkills = skills.filter(
+    (s) => !s.options.disableModelInvocation,
+  );
+
+  if (invocableSkills.length === 0) return "";
+
+  const skillsList = invocableSkills
+    .map((s) => {
+      const suffix = s.options.userInvocable === false ? " (model-only)" : "";
+      return `- ${s.name}: ${s.description}${suffix}`;
+    })
+    .join("\n");
+
+  return `
+## Skills
+- \`skill\` - Execute a skill to extend your capabilities
+- Use the \`skill\` tool to invoke skills when relevant to the user's request
+- When a user references "/<skill-name>" (e.g., "/commit"), invoke the corresponding skill
+- Some skills may be model-only (not user-invocable) and should be invoked automatically when relevant
+
+Available skills:
+${skillsList}
+
+When a skill is relevant, invoke it IMMEDIATELY using the skill tool.
+If you see a <command-name> tag in the conversation, the skill is already loaded - follow its instructions directly.`;
 }
 
 export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
@@ -220,6 +259,14 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
     parts.push(
       `\n# Project-Specific Instructions\n\n${options.customInstructions}`,
     );
+  }
+
+  // Add skills section if skills are available
+  if (options.skills && options.skills.length > 0) {
+    const skillsPrompt = buildSkillsPrompt(options.skills);
+    if (skillsPrompt) {
+      parts.push(skillsPrompt);
+    }
   }
 
   return parts.join("\n");
