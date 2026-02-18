@@ -4,6 +4,7 @@ import type { AskUserQuestionInput, TaskToolUIPart } from "@open-harness/agent";
 import { isToolUIPart } from "ai";
 import {
   Archive,
+  ArchiveRestore,
   ArrowDown,
   ArrowLeft,
   ArrowUp,
@@ -332,6 +333,7 @@ function SandboxInputOverlay({
   isRestoring,
   isReconnecting,
   isHibernating,
+  isArchived,
   hasSnapshot,
   onRestore,
   onCreateNew,
@@ -341,10 +343,24 @@ function SandboxInputOverlay({
   isRestoring: boolean;
   isReconnecting: boolean;
   isHibernating: boolean;
+  isArchived: boolean;
   hasSnapshot: boolean;
   onRestore: () => void;
   onCreateNew: () => void;
 }) {
+  if (isArchived) {
+    return (
+      <div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-background/60 backdrop-blur-[2px]">
+        <div className="flex items-center gap-3 rounded-full bg-background/90 px-4 py-2 text-muted-foreground shadow-sm">
+          <Archive className="h-4 w-4" />
+          <span className="text-sm">
+            This session is archived. Unarchive it to resume.
+          </span>
+        </div>
+      </div>
+    );
+  }
+
   if (isSandboxActive && !isCreating && !isRestoring) {
     return null;
   }
@@ -411,6 +427,7 @@ function ShareDialog({
     if (!baseUrl) {
       setBaseUrl(window.location.origin);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- run once on mount
   }, []);
 
   const shareUrl = shareId && baseUrl ? `${baseUrl}/shared/${shareId}` : null;
@@ -546,6 +563,7 @@ export function SessionChatContent() {
   const [input, setInput] = useState("");
   const [isCreatingSandbox, setIsCreatingSandbox] = useState(false);
   const [isRestoringSnapshot, setIsRestoringSnapshot] = useState(false);
+  const [isUnarchiving, setIsUnarchiving] = useState(false);
   const [prDialogOpen, setPrDialogOpen] = useState(false);
   const [repoDialogOpen, setRepoDialogOpen] = useState(false);
   const [showDiffPanel, setShowDiffPanel] = useState(false);
@@ -636,6 +654,7 @@ export function SessionChatContent() {
     sandboxInfo,
     setSandboxInfo,
     archiveSession,
+    unarchiveSession,
     updateSessionTitle,
     updateChatModel,
     hadInitialMessages,
@@ -1150,9 +1169,13 @@ export function SessionChatContent() {
   const hasAutoRestoredSnapshotRef = useRef(false);
   const shouldAutoResumeOnEntryRef = useRef(true);
 
+  const isArchived = session.status === "archived";
+
   // Attempt a single reconnect probe on entry to pick up authoritative server state
   // (connected sandbox, no sandbox, and snapshot availability).
+  // Skip for archived sessions -- they should never spin up a sandbox.
   useEffect(() => {
+    if (isArchived) return;
     if (
       !sandboxInfo &&
       !isCreatingSandbox &&
@@ -1162,6 +1185,7 @@ export function SessionChatContent() {
       void attemptReconnection();
     }
   }, [
+    isArchived,
     sandboxInfo,
     isCreatingSandbox,
     isRestoringSnapshot,
@@ -1178,7 +1202,9 @@ export function SessionChatContent() {
   }, [sandboxInfo, reconnectionStatus]);
 
   // Auto-resume paused sessions on entry once we know there is no active runtime sandbox.
+  // Skip for archived sessions.
   useEffect(() => {
+    if (isArchived) return;
     if (!hasSnapshot) {
       hasAutoRestoredSnapshotRef.current = false;
       return;
@@ -1193,6 +1219,7 @@ export function SessionChatContent() {
     shouldAutoResumeOnEntryRef.current = false;
     void handleRestoreSnapshot();
   }, [
+    isArchived,
     session.id,
     hasSnapshot,
     sandboxInfo,
@@ -1272,7 +1299,9 @@ export function SessionChatContent() {
   ]);
 
   // Auto-create sandbox right away for new sessions/chats.
+  // Skip for archived sessions.
   useEffect(() => {
+    if (isArchived) return;
     if (sandboxInfo || isCreatingSandbox || isRestoringSnapshot) return;
 
     // If we have stored sandbox state, wait for reconnect attempt first.
@@ -1293,6 +1322,7 @@ export function SessionChatContent() {
 
     void ensureSandboxReady();
   }, [
+    isArchived,
     session.sandboxState,
     hasSnapshot,
     reconnectionStatus,
@@ -1454,6 +1484,9 @@ export function SessionChatContent() {
   const isSandboxActive = isSandboxValid(sandboxInfo) && serverSaysActive;
 
   const sandboxUiStatus = (() => {
+    if (isArchived) {
+      return { label: "Archived", className: "bg-muted text-muted-foreground" };
+    }
     if (isCreatingSandbox) {
       return { label: "Creating", className: "bg-amber-500/15 text-amber-700" };
     }
@@ -1773,40 +1806,70 @@ export function SessionChatContent() {
                 sessionId={session.id}
                 initialShareId={session.shareId}
               />
-              <Dialog>
-                <DialogTrigger asChild>
-                  <Button variant="ghost" size="sm">
-                    <Archive className="h-4 w-4 md:mr-2" />
-                    <span className="hidden md:inline">Archive</span>
-                  </Button>
-                </DialogTrigger>
-                <DialogContent showCloseButton={false}>
-                  <DialogHeader>
-                    <DialogTitle>Archive session?</DialogTitle>
-                    <DialogDescription>
-                      This will stop the sandbox and archive the session. You
-                      can still view it in the archive tab.
-                    </DialogDescription>
-                  </DialogHeader>
-                  <DialogFooter>
-                    <DialogClose asChild>
-                      <Button variant="outline">Cancel</Button>
-                    </DialogClose>
-                    <DialogClose asChild>
-                      <Button
-                        onClick={() => {
-                          void archiveSession().catch((error: unknown) => {
-                            console.error("Failed to archive session:", error);
-                          });
-                          router.push("/");
-                        }}
-                      >
-                        Archive
-                      </Button>
-                    </DialogClose>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
+              {isArchived ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={isUnarchiving}
+                  onClick={() => {
+                    setIsUnarchiving(true);
+                    void unarchiveSession()
+                      .catch((error: unknown) => {
+                        console.error("Failed to unarchive session:", error);
+                      })
+                      .finally(() => {
+                        setIsUnarchiving(false);
+                      });
+                  }}
+                >
+                  {isUnarchiving ? (
+                    <Loader2 className="h-4 w-4 animate-spin md:mr-2" />
+                  ) : (
+                    <ArchiveRestore className="h-4 w-4 md:mr-2" />
+                  )}
+                  <span className="hidden md:inline">
+                    {isUnarchiving ? "Unarchiving..." : "Unarchive"}
+                  </span>
+                </Button>
+              ) : (
+                <Dialog>
+                  <DialogTrigger asChild>
+                    <Button variant="ghost" size="sm">
+                      <Archive className="h-4 w-4 md:mr-2" />
+                      <span className="hidden md:inline">Archive</span>
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent showCloseButton={false}>
+                    <DialogHeader>
+                      <DialogTitle>Archive session?</DialogTitle>
+                      <DialogDescription>
+                        This will stop the sandbox and archive the session. You
+                        can still view it in the archive tab.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <DialogFooter>
+                      <DialogClose asChild>
+                        <Button variant="outline">Cancel</Button>
+                      </DialogClose>
+                      <DialogClose asChild>
+                        <Button
+                          onClick={() => {
+                            void archiveSession().catch((error: unknown) => {
+                              console.error(
+                                "Failed to archive session:",
+                                error,
+                              );
+                            });
+                            router.push("/");
+                          }}
+                        >
+                          Archive
+                        </Button>
+                      </DialogClose>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
+              )}
               {!supportsDiff ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -2133,6 +2196,7 @@ export function SessionChatContent() {
               <form
                 onSubmit={async (e) => {
                   e.preventDefault();
+                  if (isArchived) return;
                   const hasContent = input.trim() || images.length > 0;
                   if (!hasContent) return;
 
@@ -2200,6 +2264,7 @@ export function SessionChatContent() {
                   isRestoring={isRestoringSnapshot}
                   isReconnecting={isReconnectingSandbox && !isHibernatingUi}
                   isHibernating={isHibernatingUi}
+                  isArchived={isArchived}
                   hasSnapshot={hasSnapshot}
                   onRestore={handleRestoreSnapshot}
                   onCreateNew={handleCreateNewSandbox}
@@ -2254,7 +2319,7 @@ export function SessionChatContent() {
                         }
                       }
                     }}
-                    disabled={status === "streaming"}
+                    disabled={isArchived || status === "streaming"}
                     className="w-full resize-none overflow-y-auto bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none"
                     style={{ minHeight: "24px" }}
                   />
@@ -2268,6 +2333,7 @@ export function SessionChatContent() {
                       variant="ghost"
                       size="icon"
                       onClick={openFilePicker}
+                      disabled={isArchived}
                       className="h-8 w-8 rounded-full text-muted-foreground hover:text-foreground"
                     >
                       <Paperclip className="h-4 w-4" />
@@ -2308,7 +2374,7 @@ export function SessionChatContent() {
                       variant="ghost"
                       size="icon"
                       onClick={handleMicClick}
-                      disabled={recordingState === "processing"}
+                      disabled={isArchived || recordingState === "processing"}
                       className={`relative h-8 w-8 rounded-full ${
                         recordingState === "recording"
                           ? "text-red-500"
@@ -2344,6 +2410,7 @@ export function SessionChatContent() {
                         type="submit"
                         size="icon"
                         disabled={
+                          isArchived ||
                           (!input.trim() && images.length === 0) ||
                           isUpdatingModel
                         }
