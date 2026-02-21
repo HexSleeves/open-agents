@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { connectSandbox } from "@open-harness/sandbox";
+import { connectSandbox, type Sandbox } from "@open-harness/sandbox";
 import { getSessionById, updateSession } from "@/lib/db/sessions";
 import { buildHibernatedLifecycleUpdate } from "@/lib/sandbox/lifecycle";
 import {
@@ -12,6 +12,8 @@ import { getServerSession } from "@/lib/session/get-server-session";
 export type DiffFile = {
   path: string;
   status: "added" | "modified" | "deleted" | "renamed";
+  /** May be absent in cached diffs created before this field was introduced. */
+  stagingStatus?: "staged" | "unstaged" | "partial";
   additions: number;
   deletions: number;
   diff: string;
@@ -25,6 +27,8 @@ export type DiffResponse = {
     totalAdditions: number;
     totalDeletions: number;
   };
+  /** The git ref used as the diff base (e.g. "origin/main", "HEAD"). May be absent in old cached diffs. */
+  baseRef?: string;
 };
 
 type RouteContext = {
@@ -160,6 +164,82 @@ function splitDiffByFile(fullDiff: string): Map<string, string> {
   return result;
 }
 
+/**
+ * Build a synthetic unified-diff and DiffFile entry for an untracked (new) file.
+ * Returns null if the content is null (unreadable / binary).
+ */
+function buildUntrackedDiffFile(
+  path: string,
+  content: string | null,
+): { file: DiffFile; lineCount: number } | null {
+  if (content === null) return null;
+
+  const trimmed = content.trimEnd();
+  const lines = trimmed.length === 0 ? [] : trimmed.split("\n");
+  const lineCount = lines.length;
+
+  const diffLines = lines.map((line) => `+${line}`).join("\n");
+  const syntheticDiff = `diff --git a/${path} b/${path}
+new file mode 100644
+--- /dev/null
++++ b/${path}
+@@ -0,0 +1,${lineCount} @@
+${diffLines}`;
+
+  return {
+    file: {
+      path,
+      status: "added",
+      stagingStatus: "unstaged",
+      additions: lineCount,
+      deletions: 0,
+      diff: syntheticDiff,
+    },
+    lineCount,
+  };
+}
+
+/** Only allow ref names that look like valid git refs (alphanumeric, slashes, dots, dashes, underscores). */
+const SAFE_REF_PATTERN = /^[a-zA-Z0-9._\-/]+$/;
+
+/**
+ * Resolve the best git ref to diff against.
+ *
+ * 1. If the repo was cloned from a remote, use origin's default branch
+ *    (detected via `git symbolic-ref refs/remotes/origin/HEAD`).
+ * 2. If no remote exists (local-only sandbox), fall back to HEAD.
+ * 3. If there are no commits at all, return null so callers can handle
+ *    the empty-repo case.
+ */
+async function resolveBaseRef(
+  sandbox: Pick<Sandbox, "exec">,
+  cwd: string,
+): Promise<string | null> {
+  // Try remote default branch first
+  const symRef = await sandbox.exec(
+    "git symbolic-ref refs/remotes/origin/HEAD",
+    cwd,
+    10000,
+  );
+  if (symRef.success && symRef.stdout.trim()) {
+    // "refs/remotes/origin/main" → "origin/main"
+    const full = symRef.stdout.trim();
+    const match = full.match(/^refs\/remotes\/(.+)$/);
+    if (match && SAFE_REF_PATTERN.test(match[1])) {
+      return match[1];
+    }
+  }
+
+  // No remote — check if HEAD exists (i.e. at least one commit)
+  const headCheck = await sandbox.exec("git rev-parse HEAD", cwd, 10000);
+  if (headCheck.success && headCheck.stdout.trim()) {
+    return "HEAD";
+  }
+
+  // No commits at all
+  return null;
+}
+
 export async function GET(_req: NextRequest, context: RouteContext) {
   const session = await getServerSession();
   if (!session?.user) {
@@ -188,26 +268,120 @@ export async function GET(_req: NextRequest, context: RouteContext) {
     const sandbox = await connectSandbox(sandboxState);
     const cwd = sandbox.workingDirectory;
 
+    // Determine the best base ref for the diff:
+    // - origin's default branch (for cloned repos)
+    // - HEAD (for local repos with commits)
+    // - null (for brand-new repos with no commits)
+    const baseRef = await resolveBaseRef(sandbox, cwd);
+
     // Run git commands sequentially; some sandbox backends are not reliable
     // with concurrent command streams after reconnect.
+
+    // For repos with no commits, we can only list untracked files
+    if (baseRef === null) {
+      const untrackedResult = await sandbox.exec(
+        "git ls-files --others --exclude-standard",
+        cwd,
+        30000,
+      );
+
+      if (!untrackedResult.success) {
+        const stderr = untrackedResult.stderr || "Unknown git error";
+        if (isSandboxUnavailableError(stderr)) {
+          await updateSession(sessionId, {
+            sandboxState: clearSandboxState(sessionRecord.sandboxState),
+            ...buildHibernatedLifecycleUpdate(),
+          });
+          return Response.json(
+            { error: "Sandbox is unavailable. Please resume sandbox." },
+            { status: 409 },
+          );
+        }
+        console.error("Git command failed:", stderr);
+        return Response.json(
+          {
+            error: "Git command failed. Ensure this is a git repository.",
+          },
+          { status: 400 },
+        );
+      }
+
+      // All files are untracked in a repo with no commits
+      const files: DiffFile[] = [];
+      let totalAdditions = 0;
+
+      const untrackedFiles = untrackedResult.stdout
+        .trim()
+        .split("\n")
+        .filter((line) => line.length > 0);
+
+      const untrackedFileContents = await Promise.all(
+        untrackedFiles.map(async (filePath) => {
+          const fullPath = `${cwd}/${filePath}`;
+          try {
+            const content = await sandbox.readFile(fullPath, "utf-8");
+            return { path: filePath, content };
+          } catch {
+            return { path: filePath, content: null };
+          }
+        }),
+      );
+
+      for (const { path, content } of untrackedFileContents) {
+        const entry = buildUntrackedDiffFile(path, content);
+        if (!entry) continue;
+        totalAdditions += entry.lineCount;
+        files.push(entry.file);
+      }
+
+      const statusOrder = { modified: 0, added: 1, renamed: 2, deleted: 3 };
+      files.sort((a, b) => statusOrder[a.status] - statusOrder[b.status]);
+
+      const response: DiffResponse = {
+        files,
+        baseRef: "(no commits)",
+        summary: {
+          totalFiles: files.length,
+          totalAdditions,
+          totalDeletions: 0,
+        },
+      };
+
+      updateSession(sessionId, {
+        cachedDiff: response,
+        cachedDiffUpdatedAt: new Date(),
+        linesAdded: response.summary.totalAdditions,
+        linesRemoved: response.summary.totalDeletions,
+      }).catch((err) => console.error("Failed to cache diff:", err));
+
+      return Response.json(response);
+    }
+
+    // Normal path: we have a valid base ref to diff against
     const nameStatusResult = await sandbox.exec(
-      "git diff HEAD --name-status",
+      `git diff ${baseRef} --name-status`,
       cwd,
       30000,
     );
     const numstatResult = await sandbox.exec(
-      "git diff HEAD --numstat",
+      `git diff ${baseRef} --numstat`,
       cwd,
       30000,
     );
-    const diffResult = await sandbox.exec("git diff HEAD", cwd, 60000);
+    const diffResult = await sandbox.exec(`git diff ${baseRef}`, cwd, 60000);
     const untrackedResult = await sandbox.exec(
       "git ls-files --others --exclude-standard",
       cwd,
       30000,
     );
+    // Get staged file paths to determine staging status
+    const stagedResult = await sandbox.exec(
+      "git diff --cached --name-only",
+      cwd,
+      30000,
+    );
 
-    // Check if git commands failed (e.g., not a git repo or HEAD doesn't exist)
+    // Check if git commands failed (e.g., not a git repo or ref doesn't exist)
     if (!nameStatusResult.success || !diffResult.success) {
       const stderr =
         nameStatusResult.stderr || diffResult.stderr || "Unknown git error";
@@ -246,6 +420,30 @@ export async function GET(_req: NextRequest, context: RouteContext) {
       }
     }
 
+    // Build set of staged file paths
+    const stagedFiles = new Set<string>();
+    if (stagedResult.success && stagedResult.stdout.trim()) {
+      for (const line of stagedResult.stdout.trim().split("\n")) {
+        if (line) stagedFiles.add(unescapeGitPath(line));
+      }
+    }
+
+    // Build set of unstaged (working tree) changed file paths.
+    // We compare the working tree against the index to find files with
+    // unstaged modifications. Combined with the staged set, this lets us
+    // determine partial staging.
+    const unstagedFiles = new Set<string>();
+    const unstagedResult = await sandbox.exec(
+      "git diff --name-only",
+      cwd,
+      30000,
+    );
+    if (unstagedResult.success && unstagedResult.stdout.trim()) {
+      for (const line of unstagedResult.stdout.trim().split("\n")) {
+        if (line) unstagedFiles.add(unescapeGitPath(line));
+      }
+    }
+
     // Parse outputs
     const fileStatuses = parseNameStatus(nameStatusResult.stdout);
     const fileStats = parseStats(numstatResult.stdout);
@@ -255,6 +453,22 @@ export async function GET(_req: NextRequest, context: RouteContext) {
     const files: DiffFile[] = [];
     let totalAdditions = 0;
     let totalDeletions = 0;
+
+    // Determine staging status for a file.
+    // When diffing against a remote base (e.g. origin/main), a file might
+    // appear in the full diff because of committed, staged, or unstaged
+    // changes. We use the index-level info to classify:
+    function getStagingStatus(filePath: string): DiffFile["stagingStatus"] {
+      const isStaged = stagedFiles.has(filePath);
+      const isUnstaged = unstagedFiles.has(filePath);
+      if (isStaged && isUnstaged) return "partial";
+      if (isStaged) return "staged";
+      // Files that are in neither set are already committed on the branch
+      // (relative to HEAD, they have no pending changes). Treat them as
+      // staged since they're part of committed work.
+      if (!isStaged && !isUnstaged) return "staged";
+      return "unstaged";
+    }
 
     // Add tracked file changes
     for (const [path, statusInfo] of fileStatuses) {
@@ -267,6 +481,7 @@ export async function GET(_req: NextRequest, context: RouteContext) {
       files.push({
         path,
         status: statusInfo.status,
+        stagingStatus: getStagingStatus(path),
         additions: stats.additions,
         deletions: stats.deletions,
         diff,
@@ -295,32 +510,10 @@ export async function GET(_req: NextRequest, context: RouteContext) {
     );
 
     for (const { path, content } of untrackedFileContents) {
-      // Skip binary files or files we couldn't read
-      if (content === null) continue;
-
-      // Remove trailing newlines before splitting to get accurate line count
-      const trimmed = content.trimEnd();
-      const lines = trimmed.length === 0 ? [] : trimmed.split("\n");
-      const lineCount = lines.length;
-
-      // Generate a synthetic diff for the new file
-      const diffLines = lines.map((line) => `+${line}`).join("\n");
-      const syntheticDiff = `diff --git a/${path} b/${path}
-new file mode 100644
---- /dev/null
-+++ b/${path}
-@@ -0,0 +1,${lineCount} @@
-${diffLines}`;
-
-      totalAdditions += lineCount;
-
-      files.push({
-        path,
-        status: "added",
-        additions: lineCount,
-        deletions: 0,
-        diff: syntheticDiff,
-      });
+      const entry = buildUntrackedDiffFile(path, content);
+      if (!entry) continue;
+      totalAdditions += entry.lineCount;
+      files.push(entry.file);
     }
 
     // Sort files: modified first, then added, then renamed, then deleted
@@ -329,6 +522,7 @@ ${diffLines}`;
 
     const response: DiffResponse = {
       files,
+      baseRef,
       summary: {
         totalFiles: files.length,
         totalAdditions,
