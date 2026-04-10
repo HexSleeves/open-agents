@@ -347,28 +347,27 @@ export function PreferencesSection() {
       <div className="space-y-4">
         <SectionHeader>General</SectionHeader>
         <div className="grid gap-6 sm:grid-cols-2">
-          {/* Theme */}
-          <div className="grid gap-2">
-            <Label htmlFor="appearance">Theme</Label>
-            <Select value={theme} onValueChange={handleThemeChange}>
-              <SelectTrigger id="appearance" className="w-full">
-                <SelectValue placeholder="Select an appearance" />
-              </SelectTrigger>
-              <SelectContent>
-                {THEME_OPTIONS.map((option) => (
-                  <SelectItem key={option.id} value={option.id}>
-                    {option.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-muted-foreground">
-              Saved in your current browser.
-            </p>
-          </div>
+          {/* Left column: dropdowns */}
+          <div className="space-y-4">
+            <div className="grid gap-2">
+              <Label htmlFor="appearance">Theme</Label>
+              <Select value={theme} onValueChange={handleThemeChange}>
+                <SelectTrigger id="appearance" className="w-full">
+                  <SelectValue placeholder="Select an appearance" />
+                </SelectTrigger>
+                <SelectContent>
+                  {THEME_OPTIONS.map((option) => (
+                    <SelectItem key={option.id} value={option.id}>
+                      {option.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Saved in your current browser.
+              </p>
+            </div>
 
-          {/* Environment */}
-          <div className="space-y-3">
             <div className="grid gap-2">
               <Label htmlFor="sandbox">Default Sandbox</Label>
               <Select
@@ -388,6 +387,7 @@ export function PreferencesSection() {
                 </SelectContent>
               </Select>
             </div>
+
             <div className="grid gap-2">
               <Label htmlFor="diff-mode">Default Diff Mode</Label>
               <Select
@@ -409,7 +409,7 @@ export function PreferencesSection() {
             </div>
           </div>
 
-          {/* Automation */}
+          {/* Right column: toggles */}
           <div className="space-y-3">
             <div className="flex items-center justify-between gap-4">
               <div className="space-y-0.5">
