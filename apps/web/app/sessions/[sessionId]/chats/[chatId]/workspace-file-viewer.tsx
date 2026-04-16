@@ -3,6 +3,7 @@
 import { File as DiffsFile } from "@pierre/diffs/react";
 import { Check, CodeXml, Copy, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useMemo, useRef, useState } from "react";
+import { Streamdown } from "streamdown";
 import useSWR from "swr";
 import type { WorkspaceFileContentResponse } from "@/app/api/sessions/[sessionId]/files/content/route";
 import { Button } from "@/components/ui/button";
@@ -21,6 +22,7 @@ import {
 import { SelectionPopover } from "@/components/selection-popover";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { defaultFileOptions } from "@/lib/diffs-config";
+import { streamdownPlugins } from "@/lib/streamdown-config";
 import { fetcherNoStore } from "@/lib/swr";
 import { cn } from "@/lib/utils";
 
@@ -94,6 +96,16 @@ function CopyButton({
   );
 }
 
+function PlanMarkdown({ content }: { content: string }) {
+  return (
+    <div className="p-6">
+      <Streamdown mode="static" isAnimating={false} plugins={streamdownPlugins}>
+        {content}
+      </Streamdown>
+    </div>
+  );
+}
+
 function ViewerBody({
   editorBusy,
   editorDisabledReason,
@@ -118,6 +130,8 @@ function ViewerBody({
   response: WorkspaceFileContentResponse | undefined;
 }) {
   const hasContent = response != null && response.content.length > 0;
+  const fileName = filePath.split("/").pop() ?? filePath;
+  const isPlanFile = fileName.toLowerCase() === "plan.md";
   const fileOptions = shouldWrapFileContent(filePath)
     ? { ...defaultFileOptions, overflow: "wrap" as const }
     : defaultFileOptions;
@@ -194,6 +208,8 @@ function ViewerBody({
             <div className="px-4 py-6 text-sm text-muted-foreground">
               This file is empty.
             </div>
+          ) : isPlanFile ? (
+            <PlanMarkdown content={response.content} />
           ) : (
             <DiffsFile
               file={{ name: filePath, contents: response.content }}
