@@ -6,9 +6,18 @@ import {
   type SessionRecord,
 } from "@/app/api/sessions/_lib/session-context";
 import { botIdConfig } from "@/lib/botid";
-import { getGitHubUserProfile, getUserGitHubToken } from "@/lib/github/token";
+import { getGitHubUserProfile } from "@/lib/github/users";
 import { updateSession } from "@/lib/db/sessions";
 import { parseGitHubUrl } from "@/lib/github/client";
+import {
+  verifyRepoAccess,
+  getRepoAccessErrorMessage,
+} from "@/lib/github/access";
+import {
+  mintInstallationToken,
+  revokeInstallationToken,
+  type ScopedInstallationToken,
+} from "@/lib/github/app";
 import {
   DEFAULT_SANDBOX_BASE_SNAPSHOT_ID,
   DEFAULT_SANDBOX_PORTS,
@@ -108,26 +117,7 @@ export async function POST(req: Request) {
     return Response.json({ error: "Access denied" }, { status: 403 });
   }
 
-  const githubToken = await getUserGitHubToken(session.user.id);
-
-  if (repoUrl) {
-    const parsedRepo = parseGitHubUrl(repoUrl);
-    if (!parsedRepo) {
-      return Response.json(
-        { error: "Invalid GitHub repository URL" },
-        { status: 400 },
-      );
-    }
-
-    if (!githubToken) {
-      return Response.json(
-        { error: "Connect GitHub to access repositories" },
-        { status: 403 },
-      );
-    }
-  }
-
-  // Validate session ownership
+  // Validate session ownership before minting any short-lived setup tokens.
   let sessionRecord: SessionRecord | undefined;
   if (sessionId) {
     const sessionContext = await requireOwnedSession({
@@ -142,24 +132,6 @@ export async function POST(req: Request) {
   }
 
   const sandboxName = sessionId ? getSessionSandboxName(sessionId) : undefined;
-  const ghProfile = await getGitHubUserProfile(session.user.id);
-  const githubNoreplyEmail =
-    ghProfile?.externalUserId && ghProfile.username
-      ? `${ghProfile.externalUserId}+${ghProfile.username}@users.noreply.github.com`
-      : undefined;
-
-  const gitUser = {
-    name: session.user.name ?? ghProfile?.username ?? session.user.username,
-    email:
-      githubNoreplyEmail ??
-      session.user.email ??
-      `${session.user.username}@users.noreply.github.com`,
-  };
-
-  // ============================================
-  // CREATE OR RESUME: Create a named persistent sandbox for this session.
-  // ============================================
-  const startTime = Date.now();
 
   const source = repoUrl
     ? {
@@ -169,23 +141,82 @@ export async function POST(req: Request) {
       }
     : undefined;
 
-  const sandbox = await connectSandbox({
-    state: {
-      type: "vercel",
-      ...(sandboxName ? { sandboxName } : {}),
-      source,
-    },
-    options: {
-      githubToken: githubToken ?? undefined,
-      gitUser,
-      timeout: DEFAULT_SANDBOX_TIMEOUT_MS,
-      ports: DEFAULT_SANDBOX_PORTS,
-      baseSnapshotId: DEFAULT_SANDBOX_BASE_SNAPSHOT_ID,
-      persistent: !!sandboxName,
-      resume: !!sandboxName,
-      createIfMissing: !!sandboxName,
-    },
-  });
+  // verify repo access (user permissions ∩ installation scope) and get
+  // a repo-scoped read token for clone/setup when a repo is provided
+  let setupToken: ScopedInstallationToken | undefined;
+
+  if (repoUrl) {
+    const parsedRepo = parseGitHubUrl(repoUrl);
+    if (!parsedRepo) {
+      return Response.json(
+        { error: "Invalid GitHub repository URL" },
+        { status: 400 },
+      );
+    }
+
+    const access = await verifyRepoAccess({
+      userId: session.user.id,
+      owner: parsedRepo.owner,
+      repo: parsedRepo.repo,
+    });
+
+    if (!access.ok) {
+      return Response.json(
+        { error: getRepoAccessErrorMessage(access.reason) },
+        { status: 403 },
+      );
+    }
+
+    setupToken = await mintInstallationToken({
+      installationId: access.installationId,
+      repositoryIds: [access.repositoryId],
+      permissions: { contents: "read" },
+    });
+  }
+
+  // ============================================
+  // CREATE OR RESUME: Create a named persistent sandbox for this session.
+  // ============================================
+  const startTime = Date.now();
+
+  let sandbox: Awaited<ReturnType<typeof connectSandbox>>;
+  try {
+    const ghProfile = await getGitHubUserProfile(session.user.id);
+    const githubNoreplyEmail =
+      ghProfile?.externalUserId && ghProfile.username
+        ? `${ghProfile.externalUserId}+${ghProfile.username}@users.noreply.github.com`
+        : undefined;
+
+    const gitUser = {
+      name: session.user.name ?? ghProfile?.username ?? session.user.username,
+      email:
+        githubNoreplyEmail ??
+        session.user.email ??
+        `${session.user.username}@users.noreply.github.com`,
+    };
+
+    sandbox = await connectSandbox({
+      state: {
+        type: "vercel",
+        ...(sandboxName ? { sandboxName } : {}),
+        source,
+      },
+      options: {
+        githubToken: setupToken?.token,
+        gitUser,
+        timeout: DEFAULT_SANDBOX_TIMEOUT_MS,
+        ports: DEFAULT_SANDBOX_PORTS,
+        baseSnapshotId: DEFAULT_SANDBOX_BASE_SNAPSHOT_ID,
+        persistent: !!sandboxName,
+        resume: !!sandboxName,
+        createIfMissing: !!sandboxName,
+      },
+    });
+  } finally {
+    if (setupToken) {
+      await revokeInstallationToken(setupToken.token);
+    }
+  }
 
   if (sessionId && sandbox.getState) {
     const nextState = sandbox.getState() as SandboxState;
